@@ -1,0 +1,987 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dashboard DW Master - Executivo & Analítico (v1.1)</title>
+
+<!-- Versões fixadas para reprodutibilidade (v1.1) -->
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+<script>
+function alternarPainelDesempenho() {
+    $("painelDesempenho").classList.toggle("hidden");
+}
+
+function esperarPintura() {
+    return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
+
+function calcularEstatisticas(tempos) {
+    const media = tempos.reduce((a, b) => a + b, 0) / tempos.length;
+    // Desvio-padrão amostral (divisor n - 1), adequado para uma amostra de repetições.
+    const variancia = tempos.length > 1
+        ? tempos.reduce((soma, valor) => soma + Math.pow(valor - media, 2), 0) / (tempos.length - 1)
+        : 0;
+    return {
+        media,
+        desvio: Math.sqrt(variancia),
+        minimo: Math.min(...tempos),
+        maximo: Math.max(...tempos)
+    };
+}
+
+function formatarMs(valor) {
+    return valor.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " ms";
+}
+
+async function medirLeituraExcel() {
+    if (!arquivoSelecionado) throw new Error("Nenhum arquivo Excel está selecionado.");
+    const tempos = [];
+
+    // Aquecimento: reduz a influência da primeira execução na série medida.
+    const aquecimento = await arquivoSelecionado.arrayBuffer();
+    const wbAquecimento = XLSX.read(aquecimento, { type: "array" });
+    ["FatoDoacao", "DimFilial", "DimTipoConta", "DimFormaPagamento"].forEach(nome => {
+        if (!wbAquecimento.Sheets[nome]) throw new Error("Planilha obrigatória ausente: " + nome);
+        XLSX.utils.sheet_to_json(wbAquecimento.Sheets[nome], { defval: null });
+    });
+
+    for (let i = 0; i < 10; i++) {
+        const inicio = performance.now();
+        const buffer = await arquivoSelecionado.arrayBuffer();
+        const wb = XLSX.read(buffer, { type: "array" });
+        const nomes = ["FatoDoacao", "DimFilial", "DimTipoConta", "DimFormaPagamento"];
+        const tabelas = {};
+        nomes.forEach(nome => {
+            if (!wb.Sheets[nome]) throw new Error("Planilha obrigatória ausente: " + nome);
+            tabelas[nome] = XLSX.utils.sheet_to_json(wb.Sheets[nome], { defval: null });
+        });
+        validarColunas(tabelas.FatoDoacao, ["Ano", "Mes", "FilialID", "TipoContaID", "FormaPagamentoID", "ValorDoacao"], "FatoDoacao");
+        validarColunas(tabelas.DimFilial, ["FilialID", "FilialNome", "RegiaoNome"], "DimFilial");
+        validarColunas(tabelas.DimTipoConta, ["TipoContaID", "TipoContaNome"], "DimTipoConta");
+        validarColunas(tabelas.DimFormaPagamento, ["FormaPagamentoID", "FormaPagamentoNome"], "DimFormaPagamento");
+        tabelas.FatoDoacao.forEach(linha => {
+            Number(linha.Ano);
+            Number(linha.Mes);
+            Number(linha.ValorDoacao);
+        });
+        tempos.push(performance.now() - inicio);
+        $("progressoDesempenho").textContent = `Leitura e processamento: ${i + 1}/10`;
+    }
+    return tempos;
+}
+
+async function medirRenderizacao() {
+    atualizar();
+    await esperarPintura(); // aquecimento
+    const tempos = [];
+    for (let i = 0; i < 10; i++) {
+        const inicio = performance.now();
+        atualizar();
+        await esperarPintura();
+        tempos.push(performance.now() - inicio);
+        $("progressoDesempenho").textContent = `Renderização do dashboard: ${i + 1}/10`;
+    }
+    return tempos;
+}
+
+async function medirFiltros() {
+    const ids = ["fAno", "fFilial", "fRegiao"];
+    const valoresOriginais = Object.fromEntries(ids.map(id => [id, $(id).value]));
+    const tempos = [];
+    const opcoesValidas = ids.map(id => ({
+        id,
+        valores: Array.from($(id).options).map(opcao => opcao.value)
+    })).filter(item => item.valores.length > 1);
+
+    try {
+        atualizar();
+        await esperarPintura(); // aquecimento
+        for (let i = 0; i < 10; i++) {
+            const alvo = opcoesValidas.length ? opcoesValidas[i % opcoesValidas.length] : { id: "fAno", valores: [$( "fAno" ).value] };
+            const alternativas = alvo.valores.filter(valor => valor !== $(alvo.id).value);
+            if (alternativas.length) {
+                $(alvo.id).value = alternativas[i % alternativas.length];
+            }
+            const inicio = performance.now();
+            atualizar();
+            await esperarPintura();
+            tempos.push(performance.now() - inicio);
+            $("progressoDesempenho").textContent = `Atualização dos filtros: ${i + 1}/10`;
+        }
+    } finally {
+        ids.forEach(id => { $(id).value = valoresOriginais[id]; });
+        atualizar();
+        await esperarPintura();
+    }
+    return tempos;
+}
+
+async function gerarPDFEmMemoria() {
+    const modoVisivel = ["executivo", "analitico", "membros"].find(id => !$(id).classList.contains("hidden"));
+    const secoes = ["executivo", "analitico", "membros"];
+    const { jsPDF } = window.jspdf;
+    const pdf = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
+
+    try {
+        for (let i = 0; i < secoes.length; i++) {
+            const secao = $(secoes[i]);
+            secao.classList.remove("hidden");
+            charts.forEach(chart => chart.resize());
+            await esperarPintura();
+
+            const canvas = await html2canvas(secao, {
+                scale: 1.5,
+                backgroundColor: "#f1f5f9",
+                useCORS: true
+            });
+            const imagem = canvas.toDataURL("image/jpeg", 0.82);
+            const larguraPagina = pdf.internal.pageSize.getWidth();
+            const alturaPagina = pdf.internal.pageSize.getHeight();
+            const margem = 8;
+            const larguraUtil = larguraPagina - margem * 2;
+            const alturaUtil = alturaPagina - 20;
+            const escala = Math.min(larguraUtil / canvas.width, alturaUtil / canvas.height);
+            const w = canvas.width * escala;
+            const h = canvas.height * escala;
+            if (i > 0) pdf.addPage();
+            pdf.setFontSize(12);
+            pdf.text("Dashboard DW Master - " + (i === 0 ? "Modo Executivo" : i === 1 ? "Modo Analítico" : "Análise de Membros"), margem, 7);
+            pdf.addImage(imagem, "JPEG", margem, 12, w, h);
+            secao.classList.add("hidden");
+        }
+        // Gera o conteúdo do PDF em memória, sem disparar dez downloads.
+        return pdf.output("blob");
+    } finally {
+        ["executivo", "analitico", "membros"].forEach(id => $(id).classList.add("hidden"));
+        if (modoVisivel) $(modoVisivel).classList.remove("hidden");
+        charts.forEach(chart => chart.resize());
+        await esperarPintura();
+    }
+}
+
+async function medirExportacaoPDF() {
+    await gerarPDFEmMemoria(); // aquecimento
+    const tempos = [];
+    for (let i = 0; i < 10; i++) {
+        const inicio = performance.now();
+        const arquivoPDF = await gerarPDFEmMemoria();
+        tempos.push(performance.now() - inicio);
+        // Libera a referência antes da próxima repetição.
+        void arquivoPDF.size;
+        $("progressoDesempenho").textContent = `Geração do PDF: ${i + 1}/10`;
+    }
+    return tempos;
+}
+
+function exibirResultadosDesempenho(resultados) {
+    const metas = {
+        "Leitura e processamento do Excel": 5000,
+        "Renderização do dashboard": 3000,
+        "Atualização dos filtros": 3000,
+        "Geração do PDF": 5000
+    };
+    ultimoRelatorioDesempenho = resultados.map(item => ({ ...item, limite: metas[item.operacao] }));
+    const linhas = ultimoRelatorioDesempenho.map(item => {
+        const aprovado = item.estatisticas.media <= item.limite;
+        return `<tr>
+            <td>${item.operacao}</td>
+            <td>${formatarMs(item.estatisticas.media)}</td>
+            <td>${formatarMs(item.estatisticas.desvio)}</td>
+            <td>${formatarMs(item.estatisticas.minimo)}</td>
+            <td>${formatarMs(item.estatisticas.maximo)}</td>
+            <td>${formatarMs(item.limite)}</td>
+            <td class="${aprovado ? "status-aprovado" : "status-acima"}">${aprovado ? "Dentro da meta" : "Acima da meta"}</td>
+        </tr>`;
+    }).join("");
+
+    $("resultadosDesempenho").innerHTML = `
+        <table class="tabela-desempenho">
+            <thead><tr>
+                <th>Operação</th><th>Média</th><th>Desvio-padrão</th>
+                <th>Mínimo</th><th>Máximo</th><th>Limite</th><th>Resultado</th>
+            </tr></thead>
+            <tbody>${linhas}</tbody>
+        </table>`;
+    $("btnBaixarResultados").disabled = false;
+}
+
+async function executarTestesDesempenho() {
+    if (!dadosCarregados || !arquivoSelecionado) {
+        mostrarMensagem("Carregue a planilha Excel antes de executar os testes de desempenho.", "error");
+        return;
+    }
+
+    const controles = [
+        $("upload"), $("fAno"), $("fFilial"), $("fRegiao"),
+        ...Array.from(document.querySelectorAll(".tabBtn")),
+        document.querySelector('button[onclick="exportarPDF()"]'),
+        $("btnExecutarDesempenho")
+    ];
+    controles.forEach(controle => { if (controle) controle.disabled = true; });
+    $("btnBaixarResultados").disabled = true;
+    $("resultadosDesempenho").innerHTML = "";
+    const resultados = [];
+
+    try {
+        $("progressoDesempenho").textContent = "Iniciando medições... mantenha a página aberta.";
+        const tarefas = [
+            ["Leitura e processamento do Excel", medirLeituraExcel],
+            ["Renderização do dashboard", medirRenderizacao],
+            ["Atualização dos filtros", medirFiltros],
+            ["Geração do PDF", medirExportacaoPDF]
+        ];
+
+        for (const [operacao, funcao] of tarefas) {
+            $("progressoDesempenho").textContent = `Executando: ${operacao}...`;
+            const tempos = await funcao();
+            resultados.push({ operacao, estatisticas: calcularEstatisticas(tempos), repeticoes: tempos.length });
+        }
+
+        exibirResultadosDesempenho(resultados);
+        const totalAprovados = ultimoRelatorioDesempenho.filter(item => item.estatisticas.media <= item.limite).length;
+        $("progressoDesempenho").textContent = `Testes concluídos: ${totalAprovados} de 4 operações ficaram dentro dos limites pela média.`;
+        const navegador = navigator.userAgent;
+        $("metadadosDesempenho").textContent =
+            `Data/hora do teste: ${new Date().toLocaleString("pt-BR")} | Registros: ${fato.length.toLocaleString("pt-BR")} | Navegador: ${navegador}. ` +
+            "Observação: os tempos dependem do computador, navegador e condições de execução. O teste de PDF gera o documento em memória e não realiza download.";
+    } catch (erro) {
+        console.error(erro);
+        $("progressoDesempenho").textContent = "Não foi possível concluir os testes: " + (erro.message || erro);
+        mostrarMensagem("Falha durante os testes de desempenho. Consulte o console do navegador.", "error");
+    } finally {
+        controles.forEach(controle => { if (controle) controle.disabled = false; });
+    }
+}
+
+function baixarResultadosDesempenho() {
+    if (!ultimoRelatorioDesempenho.length) return;
+    const cabecalho = ["Operacao", "Repeticoes", "Media_ms", "Desvio_padrao_ms", "Minimo_ms", "Maximo_ms", "Limite_ms", "Resultado"];
+    const linhas = ultimoRelatorioDesempenho.map(item => {
+        const s = item.estatisticas;
+        const resultado = s.media <= item.limite ? "Dentro da meta" : "Acima da meta";
+        return [
+            item.operacao, item.repeticoes, s.media.toFixed(3), s.desvio.toFixed(3),
+            s.minimo.toFixed(3), s.maximo.toFixed(3), item.limite, resultado
+        ].map(valor => `"${String(valor).replace(/"/g, '""')}"`).join(";");
+    });
+    const csv = "\uFEFF" + [cabecalho.join(";"), ...linhas].join("\r\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "resultados_testes_desempenho_DW_Master.csv";
+    link.click();
+    URL.revokeObjectURL(url);
+}
+
+</script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+<style>
+* { box-sizing: border-box; }
+body {
+    margin: 0;
+    font-family: "Segoe UI", Arial, sans-serif;
+    background: #f1f5f9;
+    color: #1e293b;
+}
+header {
+    padding: 20px 40px;
+    font-size: 22px;
+    font-weight: 600;
+    background: #1e293b;
+    color: white;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+}
+header input { max-width: 240px; }
+.tabs {
+    padding: 30px 40px 10px;
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+.tabBtn, button {
+    background: #1e3a8a;
+    color: white;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 8px;
+    cursor: pointer;
+}
+.tabBtn:hover, button:hover { background: #1d4ed8; }
+.activeTab { background: #2563eb; }
+.filtros {
+    padding: 10px 40px 30px;
+    display: flex;
+    gap: 15px;
+    flex-wrap: wrap;
+}
+select, input {
+    padding: 8px 14px;
+    border-radius: 8px;
+    border: none;
+    background: #1e3a8a;
+    color: white;
+    font-weight: 500;
+}
+input[type="file"] { cursor: pointer; }
+select { cursor: pointer; }
+.cards {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 25px;
+    padding: 0 40px 30px;
+}
+.card, .box {
+    background: #1e3a8a;
+    padding: 20px;
+    border-radius: 14px;
+    color: white;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.08);
+    min-width: 0;
+}
+.card h2 { margin-top: 10px; color: white; overflow-wrap: anywhere; }
+.grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 25px;
+    padding: 20px 40px 60px;
+}
+.box h3 { margin: 0 0 15px; color: white; }
+canvas {
+    display: block;
+    width: 100%;
+    background: white;
+    border-radius: 10px;
+    padding: 10px;
+    max-height: 300px;
+}
+.hidden { display: none !important; }
+.card.alerta-verde { background: #166534; }
+.card.alerta-amarelo { background: #a16207; }
+.card.alerta-vermelho { background: #991b1b; }
+.card small { display: block; margin-top: 4px; opacity: .85; font-size: 12px; }
+.status-msg.warning { background: #fef3c7; color: #92400e; }
+.status-msg {
+    margin: 0 40px 20px;
+    padding: 12px 16px;
+    border-radius: 8px;
+    background: #dbeafe;
+    color: #1e3a8a;
+    display: none;
+}
+.status-msg.error { background: #fee2e2; color: #991b1b; }
+.status-msg.success { background: #dcfce7; color: #166534; }
+
+.painel-desempenho {
+    margin: 0 40px 30px;
+    padding: 22px;
+    background: #ffffff;
+    border: 1px solid #dbe3ef;
+    border-radius: 14px;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.05);
+}
+.painel-desempenho h2 { margin: 0 0 8px; color: #1e293b; }
+.painel-desempenho p { color: #475569; margin: 6px 0 14px; }
+.acoes-desempenho { display: flex; gap: 10px; flex-wrap: wrap; margin: 14px 0; }
+.acoes-desempenho button:disabled { opacity: .6; cursor: wait; }
+.tabela-desempenho { width: 100%; border-collapse: collapse; margin-top: 14px; }
+.tabela-desempenho th, .tabela-desempenho td {
+    padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: left;
+}
+.tabela-desempenho th { background: #eff6ff; color: #1e3a8a; }
+.status-aprovado { color: #166534; font-weight: 700; }
+.status-acima { color: #b45309; font-weight: 700; }
+.metadados-desempenho { font-size: 13px; color: #64748b; overflow-wrap: anywhere; }
+#progressoDesempenho { font-weight: 600; color: #1e3a8a; }
+@media (max-width: 650px) {
+    .painel-desempenho { margin-left: 18px; margin-right: 18px; padding: 14px; overflow-x: auto; }
+    .tabela-desempenho { min-width: 650px; }
+}
+
+@media (max-width: 1000px) {
+    .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 650px) {
+    header, .tabs, .filtros { padding-left: 18px; padding-right: 18px; }
+    .cards, .grid { grid-template-columns: 1fr; padding-left: 18px; padding-right: 18px; }
+    .status-msg { margin-left: 18px; margin-right: 18px; }
+}
+</style>
+</head>
+
+<body>
+<div id="dashboard">
+<header>
+    <div>📊 Dashboard DW Master</div>
+    <div>
+        <input type="file" id="upload" accept=".xlsx,.xls,.xlsm">
+        <button onclick="exportarPDF()">Exportar PDF</button>
+        <button onclick="alternarPainelDesempenho()">Testes de desempenho</button>
+    </div>
+</header>
+
+<div class="tabs">
+    <button class="tabBtn activeTab" onclick="trocarModo(event,'executivo')">Modo Executivo</button>
+    <button class="tabBtn" onclick="trocarModo(event,'analitico')">Modo Analítico</button>
+    <button class="tabBtn" onclick="trocarModo(event,'membros')">Análise de Membros</button>
+</div>
+
+<div class="filtros">
+    <select id="fAno"><option value="Todos">Todos Anos</option></select>
+    <select id="fFilial"><option value="Todos">Todas Filiais</option></select>
+    <select id="fRegiao"><option value="Todos">Todas Regiões</option></select>
+    <button onclick="resetFiltros()">Reset</button>
+</div>
+
+<div id="mensagem" class="status-msg"></div>
+
+<div id="painelDesempenho" class="painel-desempenho hidden">
+    <h2>Testes de desempenho</h2>
+    <p>O teste executa 10 repetições por operação, calcula média, desvio-padrão, mínimo e máximo e compara a média com os limites definidos no roteiro de avaliação.</p>
+    <div class="acoes-desempenho">
+        <button id="btnExecutarDesempenho" onclick="executarTestesDesempenho()">Executar testes (10 repetições)</button>
+        <button id="btnBaixarResultados" onclick="baixarResultadosDesempenho()" disabled>Baixar resultados CSV</button>
+    </div>
+    <div id="progressoDesempenho" aria-live="polite">Carregue a planilha para habilitar os testes.</div>
+    <div id="resultadosDesempenho"></div>
+    <div id="metadadosDesempenho" class="metadados-desempenho"></div>
+</div>
+
+
+<!-- EXECUTIVO -->
+<div id="executivo">
+    <div class="cards">
+        <div class="card"><h4>Total Arrecadado</h4><h2 id="total">R$ 0,00</h2></div>
+        <div class="card" id="cardMeta"><h4>% Meta</h4><h2 id="pct">—</h2><small id="pctInfo"></small></div>
+        <div class="card"><h4>Ticket Médio</h4><h2 id="ticket">R$ 0,00</h2></div>
+        <div class="card" id="cardYoy"><h4>Ano vs Ano</h4><h2 id="yoy">—</h2><small id="yoyInfo"></small></div>
+    </div>
+    <div class="grid">
+        <div class="box"><h3>Arrecadação por Região</h3><canvas id="regiaoChart"></canvas></div>
+        <div class="box"><h3>Arrecadação por Filial</h3><canvas id="filialChart"></canvas></div>
+        <div class="box"><h3>Evolução Anual</h3><canvas id="linha"></canvas></div>
+    </div>
+</div>
+
+<!-- ANALÍTICO -->
+<div id="analitico" class="hidden">
+    <div class="grid">
+        <div class="box"><h3>Tipo de Conta</h3><canvas id="tipoContaChart"></canvas></div>
+        <div class="box"><h3>Forma de Pagamento</h3><canvas id="formaChart"></canvas></div>
+        <div class="box"><h3>Arrecadação por Trimestre e Ano</h3><canvas id="trimestreChart"></canvas></div>
+    </div>
+</div>
+
+<!-- MEMBROS -->
+<div id="membros" class="hidden">
+    <div class="grid">
+        <div class="box"><h3>Top 10 Membros</h3><canvas id="membroChart"></canvas></div>
+    </div>
+</div>
+</div>
+
+<script>
+"use strict";
+
+let fato = [];
+let dimFilial = [];
+let dimTipo = [];
+let dimForma = [];
+let charts = [];
+let dadosCarregados = false;
+let arquivoSelecionado = null;
+let ultimoRelatorioDesempenho = [];
+
+const $ = id => document.getElementById(id);
+const moeda = valor => Number(valor || 0).toLocaleString("pt-BR", {
+    style: "currency", currency: "BRL"
+});
+
+function mostrarMensagem(texto, tipo = "success") {
+    const el = $("mensagem");
+    el.textContent = texto;
+    el.className = "status-msg " + tipo;
+    el.style.display = "block";
+}
+function ocultarMensagem() {
+    $("mensagem").style.display = "none";
+}
+
+$("upload").addEventListener("change", async function(event) {
+    const arquivo = event.target.files && event.target.files[0];
+    if (!arquivo) return;
+
+    // A extensão é apenas a primeira verificação; a estrutura interna também será validada.
+    if (!/\.(xlsx|xls|xlsm)$/i.test(arquivo.name)) {
+        mostrarMensagem("Arquivo inválido. Selecione uma planilha Excel (.xlsx, .xls ou .xlsm). Os dados atuais foram preservados.", "error");
+        event.target.value = "";
+        return;
+    }
+
+    try {
+        if (typeof arquivo.arrayBuffer !== "function") {
+            throw new Error("Este navegador não oferece suporte à leitura deste arquivo. Atualize o navegador e tente novamente.");
+        }
+
+        const buffer = await arquivo.arrayBuffer();
+        if (!buffer || buffer.byteLength === 0) {
+            throw new Error("O arquivo está vazio ou não contém dados legíveis.");
+        }
+
+        const wb = XLSX.read(buffer, { type: "array" });
+        const obrigatorias = ["FatoDoacao", "DimFilial", "DimTipoConta", "DimFormaPagamento"];
+        const ausentes = obrigatorias.filter(nome => !wb.Sheets[nome]);
+        if (ausentes.length) {
+            throw new Error("A planilha não contém a(s) aba(s) obrigatória(s): " + ausentes.join(", ") + ".");
+        }
+
+        // Os dados são preparados em variáveis temporárias. A base atual só muda
+        // depois que todas as validações forem concluídas com sucesso.
+        const novaFato = XLSX.utils.sheet_to_json(wb.Sheets["FatoDoacao"], { defval: null });
+        const novaFilial = XLSX.utils.sheet_to_json(wb.Sheets["DimFilial"], { defval: null });
+        const novaTipo = XLSX.utils.sheet_to_json(wb.Sheets["DimTipoConta"], { defval: null });
+        const novaForma = XLSX.utils.sheet_to_json(wb.Sheets["DimFormaPagamento"], { defval: null });
+
+        validarColunas(novaFato, ["Ano", "Mes", "FilialID", "TipoContaID", "FormaPagamentoID", "ValorDoacao"], "FatoDoacao");
+        validarColunas(novaFilial, ["FilialID", "FilialNome", "RegiaoNome"], "DimFilial");
+        validarColunas(novaTipo, ["TipoContaID", "TipoContaNome"], "DimTipoConta");
+        validarColunas(novaForma, ["FormaPagamentoID", "FormaPagamentoNome"], "DimFormaPagamento");
+
+        const convertidos = novaFato.map((linha, indice) => {
+            const anoOriginal = linha.Ano;
+            const mesOriginal = linha.Mes;
+            const valorOriginal = linha.ValorDoacao;
+
+            if (anoOriginal === null || anoOriginal === undefined || String(anoOriginal).trim() === "" ||
+                mesOriginal === null || mesOriginal === undefined || String(mesOriginal).trim() === "" ||
+                valorOriginal === null || valorOriginal === undefined || String(valorOriginal).trim() === "") {
+                throw new Error("Há campos obrigatórios vazios na linha " + (indice + 2) + " da aba FatoDoacao. Confira Ano, Mes e ValorDoacao.");
+            }
+
+            const ano = Number(anoOriginal);
+            const mes = Number(mesOriginal);
+            const valor = Number(valorOriginal);
+            if (!Number.isFinite(ano) || !Number.isInteger(ano) || ano < 1900 ||
+                !Number.isFinite(mes) || !Number.isInteger(mes) || mes < 1 || mes > 12 ||
+                !Number.isFinite(valor) || valor < 0) {
+                throw new Error("Dados inválidos na linha " + (indice + 2) + " da aba FatoDoacao. Confira Ano, Mes e ValorDoacao.");
+            }
+            return { ...linha, Ano: ano, Mes: mes, ValorDoacao: valor };
+        });
+
+        if (!convertidos.length) {
+            throw new Error("A aba FatoDoacao não possui registros para carregar.");
+        }
+
+        // Commit: somente agora substitui a base e o arquivo usados pelo dashboard/testes.
+        fato = convertidos;
+        dimFilial = novaFilial;
+        dimTipo = novaTipo;
+        dimForma = novaForma;
+        arquivoSelecionado = arquivo;
+        dadosCarregados = true;
+
+        popularFiltros();
+        atualizar();
+        const relatorio = diagnosticarQualidade();
+        if (relatorio.avisos.length) {
+            mostrarMensagem("Arquivo carregado com sucesso: " + fato.length.toLocaleString("pt-BR") + " registros. Atenção à qualidade dos dados: " + relatorio.avisos.join(" ") , "warning");
+        } else {
+            mostrarMensagem("Arquivo carregado com sucesso: " + fato.length.toLocaleString("pt-BR") + " registros. Nenhuma inconsistência estrutural detectada.", "success");
+        }
+        $("progressoDesempenho").textContent = "Planilha válida carregada. Os testes de desempenho estão disponíveis.";
+    } catch (erro) {
+        console.error("Falha ao carregar planilha:", erro);
+        // Não altera dadosCarregados, arquivoSelecionado, tabelas ou gráficos:
+        // a última planilha válida continua disponível.
+        const detalhe = erro && erro.message ? erro.message : "formato inválido ou arquivo corrompido";
+        mostrarMensagem("Não foi possível carregar a planilha: " + detalhe + " Os dados da última planilha válida foram preservados.", "error");
+        event.target.value = "";
+    }
+});
+
+/* Diagnóstico de qualidade (v1.1): completude das junções com as dimensões
+   e cobertura temporal de cada ano. Não altera os dados, apenas informa. */
+function diagnosticarQualidade() {
+    const avisos = [];
+    const pct = (n) => (n / fato.length * 100).toLocaleString("pt-BR", { maximumFractionDigits: 1 }) + "%";
+    const idsFilial = new Set(dimFilial.map(f => String(f.FilialID)));
+    const idsTipo = new Set(dimTipo.map(t => String(t.TipoContaID)));
+    const idsForma = new Set(dimForma.map(f => String(f.FormaPagamentoID)));
+    const semFilial = fato.filter(x => !idsFilial.has(String(x.FilialID))).length;
+    const semTipo = fato.filter(x => !idsTipo.has(String(x.TipoContaID))).length;
+    const semForma = fato.filter(x => !idsForma.has(String(x.FormaPagamentoID))).length;
+    if (semFilial) avisos.push(semFilial.toLocaleString("pt-BR") + " registro(s) (" + pct(semFilial) + ") sem filial correspondente.");
+    if (semTipo) avisos.push(semTipo.toLocaleString("pt-BR") + " registro(s) (" + pct(semTipo) + ") sem tipo de conta correspondente.");
+    if (semForma) avisos.push(semForma.toLocaleString("pt-BR") + " registro(s) (" + pct(semForma) + ") sem forma de pagamento correspondente.");
+    const meses = {};
+    fato.forEach(x => { (meses[x.Ano] = meses[x.Ano] || new Set()).add(x.Mes); });
+    const incompletos = Object.keys(meses).filter(ano => meses[ano].size < 12)
+        .map(ano => ano + " (" + meses[ano].size + " meses)");
+    if (incompletos.length) avisos.push("Ano(s) com cobertura incompleta: " + incompletos.join(", ") + "; as comparações anuais usam apenas meses equivalentes.");
+    const cobertura = Object.fromEntries(Object.keys(meses).map(ano => [ano, [...meses[ano]].sort((a, b) => a - b)]));
+    console.table({ registros: fato.length, semFilial, semTipo, semForma });
+    console.log("Cobertura temporal (meses por ano):", cobertura);
+    return { avisos, semFilial, semTipo, semForma, cobertura };
+}
+
+function validarColunas(linhas, colunas, nomePlanilha) {
+    if (!linhas.length) throw new Error("A planilha " + nomePlanilha + " está vazia.");
+    const faltantes = colunas.filter(coluna => !(coluna in linhas[0]));
+    if (faltantes.length) {
+        throw new Error("Coluna(s) ausente(s) em " + nomePlanilha + ": " + faltantes.join(", "));
+    }
+}
+
+function popularFiltros() {
+    const anos = [...new Set(fato.map(x => x.Ano))].sort((a,b) => a-b);
+    $("fAno").innerHTML = '<option value="Todos">Todos Anos</option>';
+    anos.forEach(ano => $("fAno").add(new Option(ano, ano)));
+
+    $("fFilial").innerHTML = '<option value="Todos">Todas Filiais</option>';
+    dimFilial.forEach(f => $("fFilial").add(new Option(f.FilialNome, f.FilialNome)));
+
+    $("fRegiao").innerHTML = '<option value="Todos">Todas Regiões</option>';
+    const regioes = [...new Set(dimFilial.map(x => String(x.RegiaoNome || "").trim()).filter(Boolean))].sort();
+    regioes.forEach(regiao => $("fRegiao").add(new Option(regiao, regiao)));
+}
+
+["fAno", "fFilial", "fRegiao"].forEach(id => $(id).addEventListener("change", atualizar));
+
+function resetFiltros() {
+    $("fAno").value = "Todos";
+    $("fFilial").value = "Todos";
+    $("fRegiao").value = "Todos";
+    atualizar();
+}
+
+function getFilial(id) {
+    const filial = dimFilial.find(f => String(f.FilialID) === String(id));
+    return filial ? String(filial.FilialNome || "Filial não informada").trim() : "Filial não informada";
+}
+function getRegiao(id) {
+    const filial = dimFilial.find(f => String(f.FilialID) === String(id));
+    return filial ? String(filial.RegiaoNome || "Região não informada").trim() : "Região não informada";
+}
+function getTipo(id) {
+    const tipo = dimTipo.find(t => String(t.TipoContaID) === String(id));
+    return tipo ? String(tipo.TipoContaNome || "Tipo não informado").trim() : "Tipo não informado";
+}
+function getForma(id) {
+    const forma = dimForma.find(f => String(f.FormaPagamentoID) === String(id));
+    return forma ? String(forma.FormaPagamentoNome || "Forma não informada").trim() : "Forma não informada";
+}
+
+function obterDadosFiltrados() {
+    if (!dadosCarregados) return [];
+    return fato.filter(d => {
+        const anoOK = $("fAno").value === "Todos" || d.Ano === Number($("fAno").value);
+        const filialOK = $("fFilial").value === "Todos" || getFilial(d.FilialID) === $("fFilial").value;
+        const regiaoOK = $("fRegiao").value === "Todos" || getRegiao(d.FilialID) === $("fRegiao").value;
+        return anoOK && filialOK && regiaoOK;
+    });
+}
+
+function atualizar() {
+    if (!dadosCarregados) return;
+    charts.forEach(chart => chart.destroy());
+    charts = [];
+
+    const dados = obterDadosFiltrados();
+    calcularKPIs(dados);
+    graficoLinha(dados);
+    graficoFilial(dados);
+    graficoRegiao(dados);
+    graficoTipoConta(dados);
+    graficoForma(dados);
+    graficoTrimestre(dados);
+    graficoMembros(dados);
+}
+
+function somar(dados) {
+    return dados.reduce((soma, item) => soma + item.ValorDoacao, 0);
+}
+
+/* Para comparar anos, usa os mesmos meses que existem no ano de referência.
+   Os filtros de filial e região são preservados nos dois períodos. */
+function obterComparacaoAnual(dadosFiltrados) {
+    if (!fato.length) return null;
+
+    const anosDisponiveis = [...new Set(fato.map(x => x.Ano))].sort((a,b) => a-b);
+    const anoAtual = $("fAno").value === "Todos"
+        ? anosDisponiveis[anosDisponiveis.length - 1]
+        : Number($("fAno").value);
+    const anoAnterior = anoAtual - 1;
+
+    const dadosAtual = dadosFiltrados.filter(x => x.Ano === anoAtual);
+    if (!dadosAtual.length) return null;
+
+    const mesesAnoAtual = new Set(dadosAtual.map(x => x.Mes));
+    const filialSelecionada = $("fFilial").value;
+    const regiaoSelecionada = $("fRegiao").value;
+    const dadosAnteriorCandidatos = fato.filter(x => {
+        const filialOK = filialSelecionada === "Todos" || getFilial(x.FilialID) === filialSelecionada;
+        const regiaoOK = regiaoSelecionada === "Todos" || getRegiao(x.FilialID) === regiaoSelecionada;
+        return x.Ano === anoAnterior && filialOK && regiaoOK;
+    });
+    const mesesAnoAnterior = new Set(dadosAnteriorCandidatos.map(x => x.Mes));
+    const mesesComparaveis = [...mesesAnoAtual].filter(mes => mesesAnoAnterior.has(mes));
+    if (!mesesComparaveis.length) return null;
+
+    const dadosAtualComparaveis = dadosAtual.filter(x => mesesComparaveis.includes(x.Mes));
+    const dadosAnterior = dadosAnteriorCandidatos.filter(x => mesesComparaveis.includes(x.Mes));
+    if (!dadosAtualComparaveis.length || !dadosAnterior.length) return null;
+    return {
+        anoAtual,
+        anoAnterior,
+        meses: mesesComparaveis,
+        totalAtual: somar(dadosAtualComparaveis),
+        totalAnterior: somar(dadosAnterior)
+    };
+}
+
+function calcularKPIs(dados) {
+    ["cardMeta", "cardYoy"].forEach(id => $(id).classList.remove("alerta-verde", "alerta-amarelo", "alerta-vermelho"));
+    $("pctInfo").innerText = "";
+    $("yoyInfo").innerText = "";
+    const total = somar(dados);
+    const ticket = dados.length ? total / dados.length : 0;
+
+    $("total").innerText = moeda(total);
+    $("ticket").innerText = moeda(ticket);
+
+    if (!dados.length) {
+        $("pct").innerText = "—";
+        $("yoy").innerText = "—";
+        return;
+    }
+    calcularMeta(dados);
+    calcularYoY(dados);
+}
+
+function calcularMeta(dados) {
+    const comparacao = obterComparacaoAnual(dados);
+    if (!comparacao || comparacao.totalAnterior === 0) {
+        $("pct").innerText = "—";
+        return;
+    }
+    const metaDemonstrativa = comparacao.totalAnterior * 1.20;
+    const percentualAtingido = (comparacao.totalAtual / metaDemonstrativa) * 100;
+    $("pct").innerText = percentualAtingido.toLocaleString("pt-BR", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + "%";
+    // Alerta visual (RF15): verde >= 100%, amarelo 80-99,9%, vermelho < 80%.
+    $("cardMeta").classList.add(percentualAtingido >= 100 ? "alerta-verde" : percentualAtingido >= 80 ? "alerta-amarelo" : "alerta-vermelho");
+    $("pctInfo").innerText = "Meta: " + moeda(metaDemonstrativa) + " (" + comparacao.meses.length + " meses)";
+}
+
+function calcularYoY(dados) {
+    const comparacao = obterComparacaoAnual(dados);
+    if (!comparacao || comparacao.totalAnterior === 0) {
+        $("yoy").innerText = "—";
+        return;
+    }
+    const crescimento = ((comparacao.totalAtual - comparacao.totalAnterior) / comparacao.totalAnterior) * 100;
+    const seta = crescimento >= 0 ? "▲" : "▼";
+    $("yoy").innerText = seta + " " + Math.abs(crescimento).toLocaleString("pt-BR", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + "%";
+    $("cardYoy").classList.add(crescimento >= 0 ? "alerta-verde" : "alerta-vermelho");
+    $("yoyInfo").innerText = comparacao.anoAtual + " vs " + comparacao.anoAnterior + " (" + comparacao.meses.length + " meses equivalentes)";
+}
+
+function criarGrafico(idCanvas, configuracao) {
+    const canvas = $(idCanvas);
+    if (!canvas) return;
+    const chart = new Chart(canvas, configuracao);
+    charts.push(chart);
+}
+
+function opcoesMoeda() {
+    return {
+        responsive: true,
+        maintainAspectRatio: true,
+        plugins: {
+            tooltip: {
+                callbacks: {
+                    label: ctx => (ctx.dataset.label ? ctx.dataset.label + ": " : "") + moeda(ctx.raw)
+                }
+            }
+        }
+    };
+}
+
+function graficoLinha(d) {
+    const anos = [...new Set(d.map(x => x.Ano))].sort((a,b) => a-b);
+    const valores = anos.map(ano => somar(d.filter(x => x.Ano === ano)));
+    criarGrafico("linha", {
+        type: "line",
+        data: {
+            labels: anos,
+            datasets: [{
+                label: "Arrecadação anual",
+                data: valores,
+                borderColor: "#3b82f6",
+                backgroundColor: "rgba(59,130,246,0.2)",
+                fill: true,
+                tension: 0.3
+            }]
+        },
+        options: { ...opcoesMoeda(), elements: { point: { radius: 7, hoverRadius: 9 } } }
+    });
+}
+
+function graficoAgrupado(d, campo, obterNome, idCanvas, titulo, cor) {
+    const grupos = [...new Set(d.map(x => obterNome(x[campo])))].sort();
+    const valores = grupos.map(nome => somar(d.filter(x => obterNome(x[campo]) === nome)));
+    criarGrafico(idCanvas, {
+        type: "bar",
+        data: {
+            labels: grupos,
+            datasets: [{ label: titulo, data: valores, backgroundColor: cor }]
+        },
+        options: opcoesMoeda()
+    });
+}
+
+function graficoFilial(d) {
+    graficoAgrupado(d, "FilialID", getFilial, "filialChart", "Arrecadação por filial", "#2563eb");
+}
+function graficoRegiao(d) {
+    graficoAgrupado(d, "FilialID", getRegiao, "regiaoChart", "Arrecadação por região", "#1d4ed8");
+}
+function graficoTipoConta(d) {
+    const nomes = [...new Set(d.map(x => getTipo(x.TipoContaID)))].sort();
+    const valores = nomes.map(nome => somar(d.filter(x => getTipo(x.TipoContaID) === nome)));
+    criarGrafico("tipoContaChart", {
+        type: "doughnut",
+        data: { labels: nomes, datasets: [{ data: valores }] },
+        options: opcoesMoeda()
+    });
+}
+function graficoForma(d) {
+    const nomes = [...new Set(d.map(x => getForma(x.FormaPagamentoID)))].sort();
+    const valores = nomes.map(nome => somar(d.filter(x => getForma(x.FormaPagamentoID) === nome)));
+    criarGrafico("formaChart", {
+        type: "doughnut",
+        data: { labels: nomes, datasets: [{ data: valores }] },
+        options: opcoesMoeda()
+    });
+}
+
+/* Cada ano vira uma série, permitindo comparar T1, T2, T3 e T4 separadamente. */
+function graficoTrimestre(d) {
+    const anos = [...new Set(d.map(x => x.Ano))].sort((a,b) => a-b);
+    const cores = ["#3b82f6", "#16a34a", "#f59e0b", "#9333ea", "#ef4444", "#0891b2"];
+    const datasets = anos.map((ano, indice) => ({
+        label: String(ano),
+        data: [1,2,3,4].map(trimestre => somar(d.filter(x =>
+            x.Ano === ano && Math.ceil(x.Mes / 3) === trimestre
+        ))),
+        backgroundColor: cores[indice % cores.length]
+    }));
+    criarGrafico("trimestreChart", {
+        type: "bar",
+        data: { labels: ["T1 (Jan-Mar)", "T2 (Abr-Jun)", "T3 (Jul-Set)", "T4 (Out-Dez)"], datasets },
+        options: { ...opcoesMoeda(), scales: { x: { stacked: false }, y: { beginAtZero: true } } }
+    });
+}
+
+function graficoMembros(d) {
+    const membros = {};
+    d.forEach(x => {
+        const nome = String(x.MembroNome || "").trim() || "Membro não identificado";
+        membros[nome] = (membros[nome] || 0) + x.ValorDoacao;
+    });
+    const top = Object.entries(membros).sort((a,b) => b[1]-a[1]).slice(0,10);
+    criarGrafico("membroChart", {
+        type: "bar",
+        data: {
+            labels: top.map(x => x[0]),
+            datasets: [{ label: "Total de doações por membro", data: top.map(x => x[1]), backgroundColor: "#2563eb" }]
+        },
+        options: { ...opcoesMoeda(), indexAxis: "y" }
+    });
+}
+
+function trocarModo(evento, modo) {
+    ["executivo", "analitico", "membros"].forEach(id => $(id).classList.add("hidden"));
+    $(modo).classList.remove("hidden");
+    document.querySelectorAll(".tabBtn").forEach(botao => botao.classList.remove("activeTab"));
+    evento.currentTarget.classList.add("activeTab");
+    charts.forEach(chart => chart.resize());
+}
+
+/* Exporta as três visões em páginas separadas, mesmo que estejam ocultas na tela. */
+async function exportarPDF() {
+    if (!dadosCarregados) {
+        mostrarMensagem("Carregue uma planilha Excel antes de exportar o PDF.", "error");
+        return;
+    }
+    const botao = document.querySelector('button[onclick="exportarPDF()"]');
+    const modoVisivel = ["executivo", "analitico", "membros"].find(id => !$(id).classList.contains("hidden"));
+    const { jsPDF } = window.jspdf;
+    const pdf = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
+    const secoes = [
+        { id: "executivo", titulo: "Modo Executivo" },
+        { id: "analitico", titulo: "Modo Analítico" },
+        { id: "membros", titulo: "Análise de Membros" }
+    ];
+
+    try {
+        botao.disabled = true;
+        botao.textContent = "Gerando PDF...";
+        for (let i = 0; i < secoes.length; i++) {
+            const secao = $(secoes[i].id);
+            const estavaOculta = secao.classList.contains("hidden");
+            secao.classList.remove("hidden");
+            charts.forEach(chart => chart.resize());
+            await new Promise(resolve => setTimeout(resolve, 250));
+
+            const canvas = await html2canvas(secao, {
+                scale: 2,
+                backgroundColor: "#f1f5f9",
+                useCORS: true
+            });
+            const imagem = canvas.toDataURL("image/png");
+            const larguraPagina = pdf.internal.pageSize.getWidth();
+            const alturaPagina = pdf.internal.pageSize.getHeight();
+            const margem = 8;
+            const larguraImagem = larguraPagina - margem * 2;
+            const alturaImagem = canvas.height * larguraImagem / canvas.width;
+            const alturaUtil = alturaPagina - margem * 2;
+
+            if (i > 0) pdf.addPage();
+            pdf.setFontSize(14);
+            pdf.text("Dashboard DW Master - " + secoes[i].titulo, margem, 7);
+            const escala = Math.min(larguraImagem / canvas.width, alturaUtil / canvas.height);
+            const w = canvas.width * escala;
+            const h = canvas.height * escala;
+            pdf.addImage(imagem, "PNG", margem, 12, w, h);
+
+            if (estavaOculta) secao.classList.add("hidden");
+        }
+        pdf.save("Dashboard_DW_Master.pdf");
+        if (modoVisivel) {
+            ["executivo", "analitico", "membros"].forEach(id => $(id).classList.add("hidden"));
+            $(modoVisivel).classList.remove("hidden");
+        }
+        charts.forEach(chart => chart.resize());
+        mostrarMensagem("PDF gerado com as três visões do dashboard.", "success");
+    } catch (erro) {
+        console.error(erro);
+        mostrarMensagem("Não foi possível gerar o PDF. Consulte o console do navegador para detalhes.", "error");
+    } finally {
+        botao.disabled = false;
+        botao.textContent = "Exportar PDF";
+    }
+}
+</script>
+</body>
+</html>
